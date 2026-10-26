@@ -1,0 +1,81 @@
+# Build and push OpenCVE images to GHCR (klabsinfra fork).
+# Upstream bakes OPENCVE_VERSION into the image at build time — that model is
+# kept: each tag = one application version. Triggers:
+#   - manual: Actions -> publish-images -> Run workflow (version input, default v3.1.0)
+#   - automatic on tag push matching v* (fork tags are inherited from upstream)
+# Package names follow the repo (ghcr.io/<owner>/<repo>/...), owner lowercased.
+name: publish-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Ref to bake into the images (release tag or branch)
+        required: true
+        default: v3.1.0
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  webserver:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          build-args: |
+            OPENCVE_REPOSITORY=${{ github.event.repository.clone_url }}
+            OPENCVE_VERSION=${{ needs.resolve.outputs.version }}
+            GUNICORN_CMD_ARGS=--workers 2 --access-logfile -
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/opencve-web:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ github.repository }}/opencve-web:latest
+
+  airflow:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: scheduler/Dockerfile
+          build-args: |
+            OPENCVE_REPOSITORY=${{ github.event.repository.clone_url }}
+            OPENCVE_VERSION=${{ needs.resolve.outputs.version }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/opencve-airflow:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ github.repository }}/opencve-airflow:latest

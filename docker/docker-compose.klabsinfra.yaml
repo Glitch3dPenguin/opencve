@@ -1,0 +1,266 @@
+# OpenCVE — prebuilt-image deploy for klabsinfra (Traefik)
+# Fork of opencve/opencve (BSL 1.1). This compose pulls images built by
+# .github/workflows/publish-images.yaml — NO local docker build, Portainer-ready.
+#
+# Deploy (Portainer): git deploy of this repo (the file must stay in docker/ —
+# relative paths) or paste as a stack. Registry auth: add GHCR credentials to
+# the stack (GitHub username + a PAT with read:packages).
+#
+# Before first start, edit docker/.env (the ONLY file you should need to):
+#   POSTGRES_PASSWORD          (also mirror into web/opencve/conf/.env OPENCVE_DATABASE_URL)
+#   _AIRFLOW_WWW_USER_PASSWORD (Airflow ops UI, default airflow/airflow)
+#   DJANGO_SUPERUSER_*         (your OpenCVE admin account — created on first boot)
+#   TRAEFIK_RULE               (your domain, e.g. Host(`opencve.klabsdev.com`))
+#   OPENCVE_VERSION            (image tag to run; bump + redeploy to upgrade)
+#
+# First boot: opencve-init generates the Django secret key, runs migrations,
+# collects static, imports the CVE knowledge base (10-30 min) and creates the
+# admin user; then opencve-kb-init clones the 5 KB repositories (~30 min),
+# registers the Airflow connections and unpauses the feed DAGs. Total 30-60 min.
+# Both init containers are idempotent — on every later start they re-run in
+# seconds and that is what applies DB migrations on upgrades.
+#
+# Changes vs. upstream docker/docker-compose.yaml:
+#   - build: sections replaced by image: (OPENCVE_REGISTRY/OPENCVE_VERSION)
+#   - nginx: Traefik router labels (Traefik -> nginx:80 -> gunicorn:8000;
+#     nginx stays because it serves /static/ — Django runs DEBUG=False with
+#     no static middleware, and upstream's install.sh upgrade references it)
+#   - airflow-webserver port bound to 127.0.0.1 by default (AIRFLOW_BIND_ADDR)
+#   - new one-shot services: opencve-init (web image), opencve-kb-init (airflow image)
+#   - webserver waits on opencve-init (sees the generated secret key on first boot)
+---
+name: opencve
+x-airflow-common: &airflow-common
+  image: ${OPENCVE_REGISTRY:-ghcr.io/glitch3dpenguin/opencve}/opencve-airflow:${OPENCVE_VERSION:-v3.1.0}
+  env_file:
+    - .env
+  volumes:
+    - ../scheduler/airflow.cfg:/opt/airflow/airflow.cfg:ro
+    - repositories:/home/airflow/repositories/
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      # Ops UI for the feed DAGs — off public interfaces by default (SSH tunnel in).
+      # Set AIRFLOW_BIND_ADDR to the WireGuard interface address to expose it there.
+      - "${AIRFLOW_BIND_ADDR:-127.0.0.1}:${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    restart: on-failure
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    restart: on-failure
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      opencve-kb-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    environment:
+      # Required to handle warm shutdown of the celery workers properly
+      # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
+      DUMB_INIT_SETSID: "0"
+    restart: on-failure
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      opencve-kb-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    # yamllint disable rule:line-length
+    command:
+      - -c
+      - exec /entrypoint airflow version
+    environment:
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    restart: "no"
+
+  # Fork-only one-shot: Django-side first-boot init (idempotent, re-runs on every start).
+  # Writes the generated OPENCVE_SECRET_KEY into web/opencve/conf/.env (RW mount).
+  opencve-init:
+    image: ${OPENCVE_REGISTRY:-ghcr.io/glitch3dpenguin/opencve}/opencve-web:${OPENCVE_VERSION:-v3.1.0}
+    env_file:
+      - .env
+    environment:
+      DJANGO_SUPERUSER_USERNAME: ${DJANGO_SUPERUSER_USERNAME:-opencve-admin}
+      DJANGO_SUPERUSER_PASSWORD: ${DJANGO_SUPERUSER_PASSWORD:-CHANGE_ME_STRONG}
+      DJANGO_SUPERUSER_EMAIL: ${DJANGO_SUPERUSER_EMAIL:-admin@klabsdev.com}
+    volumes:
+      - ../web/opencve/conf/.env:/app/opencve/web/opencve/conf/.env
+      - staticfiles:/app/static/
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        cd /app/opencve/web
+        CONF=/app/opencve/web/opencve/conf/.env
+        if ! grep -q '^OPENCVE_SECRET_KEY=.' "$$CONF"; then
+          KEY=$$(python manage.py generate_secret_key)
+          sed -i "s|^OPENCVE_SECRET_KEY=.*|OPENCVE_SECRET_KEY='$$KEY'|" "$$CONF"
+          echo "opencve-init: generated OPENCVE_SECRET_KEY"
+        fi
+        python manage.py migrate
+        python manage.py collectstatic --no-input
+        python manage.py shell -c "
+          from django.db import connection
+          import sys
+          c = connection.cursor()
+          c.execute('SELECT 1 FROM opencve_cves LIMIT 1')
+          sys.exit(0 if c.fetchone() else 1)
+        " || { echo "opencve-init: importing KB (10-30 min)"; python manage.py import_cves; }
+        python manage.py shell -c "
+          from django.contrib.auth import get_user_model
+          import sys
+          sys.exit(0 if get_user_model().objects.filter(is_superuser=True).exists() else 1)
+        " || python manage.py createsuperuser --noinput
+        echo "opencve-init: done"
+    restart: "no"
+
+  # Fork-only one-shot: KB repositories + Airflow connections + DAG unpause.
+  # Runs in the airflow image (it ships git; upstream clones via the same container).
+  opencve-kb-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        clone() {
+          if [ -d "$$2/.git" ]; then echo "opencve-kb-init: skip $$3 (present)"; return 0; fi
+          echo "opencve-kb-init: cloning $$3"
+          git clone "$$1" "$$2"
+        }
+        clone https://github.com/opencve/opencve-kb.git /home/airflow/repositories/opencve-kb opencve-kb
+        clone https://github.com/opencve/opencve-nvd.git /home/airflow/repositories/opencve-nvd opencve-nvd
+        clone https://github.com/opencve/opencve-redhat.git /home/airflow/repositories/opencve-redhat opencve-redhat
+        clone https://github.com/CVEProject/cvelistV5.git /home/airflow/repositories/cvelistV5 cvelistV5
+        clone https://github.com/cisagov/vulnrichment.git /home/airflow/repositories/vulnrichment vulnrichment
+        /entrypoint airflow connections delete opencve_postgres || true
+        /entrypoint airflow connections add opencve_postgres --conn-uri "postgres://$${POSTGRES_USER}:$${POSTGRES_PASSWORD}@postgres:5432/opencve"
+        /entrypoint airflow connections delete opencve_redis || true
+        /entrypoint airflow connections add opencve_redis --conn-uri "redis://redis:6379" --conn-extra '{"db": 3}'
+        /entrypoint airflow dags unpause || true
+        echo "opencve-kb-init: done"
+    environment:
+      _AIRFLOW_DB_MIGRATE: 'false'
+      _AIRFLOW_WWW_USER_CREATE: 'false'
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      opencve-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  webserver:
+    env_file:
+      - .env
+    image: ${OPENCVE_REGISTRY:-ghcr.io/glitch3dpenguin/opencve}/opencve-web:${OPENCVE_VERSION:-v3.1.0}
+    volumes:
+      - ../web/opencve/conf/.env:/app/opencve/web/opencve/conf/.env:ro
+      - ../web/opencve/conf/settings.py:/app/opencve/web/opencve/conf/settings.py:ro
+      - repositories:/app/repositories/:ro
+      - staticfiles:/app/static/
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opencve-init:
+        condition: service_completed_successfully
+
+  nginx:
+    image: nginx:trixie
+    ports:
+       - "${OPENCVE_PORT:-80}:80"
+    volumes:
+      - ./conf/opencve.conf.template:/etc/nginx/templates/opencve.conf.template:ro
+      - ./conf/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - staticfiles:/var/www/opencve/static/:ro
+    # Traefik routes to THIS container (it proxies to webserver:8000 and serves /static/).
+    # Set TRAEFIK_RULE / TRAEFIK_ENTRYPOINTS / TRAEFIK_CERTRESOLVER in docker/.env.
+    # Router/service name is fixed to `opencve`.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.opencve.rule=${TRAEFIK_RULE:-Host(`opencve.klabsdev.com`)}"
+      - "traefik.http.routers.opencve.priority=0"
+      - "traefik.http.routers.opencve.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.services.opencve.loadbalancer.server.port=80"
+      - "traefik.http.routers.opencve.tls.certresolver=${TRAEFIK_CERTRESOLVER:-cloudflare}"
+    restart: on-failure
+
+  redis:
+    image: redis/redis-stack:latest
+    healthcheck:
+       test: ["CMD", "redis-cli", "ping"]
+       interval: 10s
+       retries: 5
+       start_period: 5s
+    restart: on-failure
+
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-15}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-opencve}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opencve}
+      POSTGRES_DB: opencve
+      # Upstream typo ("postgreqsql") — left as-is on purpose: consistent between
+      # environment and volume mount; only change both together if ever.
+      PGDATA: /var/lib/postgreqsql/data
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "$POSTGRES_USER"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - ./db:/docker-entrypoint-initdb.d
+      - postgres-db:/var/lib/postgreqsql/data
+
+volumes:
+    postgres-db:
+    staticfiles:
+    repositories:
