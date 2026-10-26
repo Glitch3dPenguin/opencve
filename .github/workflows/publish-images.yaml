@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      repo: ${{ steps.resolve.outputs.repo }}
     steps:
       - id: resolve
         run: |
@@ -34,6 +35,8 @@ jobs:
           else
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
+          # ghcr package names must be lowercase; GITHUB_REPOSITORY is mixed-case
+          echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
   webserver:
     needs: resolve
@@ -55,8 +58,8 @@ jobs:
             GUNICORN_CMD_ARGS=--workers 2 --access-logfile -
           push: true
           tags: |
-            ghcr.io/${{ github.repository | lower }}/opencve-web:${{ needs.resolve.outputs.version }}
-            ghcr.io/${{ github.repository | lower }}/opencve-web:latest
+            ghcr.io/${{ needs.resolve.outputs.repo }}/opencve-web:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ needs.resolve.outputs.repo }}/opencve-web:latest
 
   airflow:
     needs: resolve
@@ -77,5 +80,5 @@ jobs:
             OPENCVE_VERSION=${{ needs.resolve.outputs.version }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository | lower }}/opencve-airflow:${{ needs.resolve.outputs.version }}
-            ghcr.io/${{ github.repository | lower }}/opencve-airflow:latest
+            ghcr.io/${{ needs.resolve.outputs.repo }}/opencve-airflow:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ needs.resolve.outputs.repo }}/opencve-airflow:latest
