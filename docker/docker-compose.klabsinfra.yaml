@@ -141,7 +141,7 @@ services:
         CONF=/app/opencve/web/opencve/conf/.env
         if ! grep -q '^OPENCVE_SECRET_KEY=.' "$$CONF"; then
           KEY=$$(python manage.py generate_secret_key)
-          sed -i "s|^OPENCVE_SECRET_KEY=.*|OPENCVE_SECRET_KEY='$$KEY'|" "$$CONF"
+          echo "OPENCVE_SECRET_KEY='$$KEY'" >> "$$CONF"
           echo "opencve-init: generated OPENCVE_SECRET_KEY"
         fi
         python manage.py migrate
