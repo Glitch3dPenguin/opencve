@@ -55,8 +55,8 @@ jobs:
             GUNICORN_CMD_ARGS=--workers 2 --access-logfile -
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}/opencve-web:${{ needs.resolve.outputs.version }}
-            ghcr.io/${{ github.repository }}/opencve-web:latest
+            ghcr.io/${{ github.repository | lower }}/opencve-web:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ github.repository | lower }}/opencve-web:latest
 
   airflow:
     needs: resolve
@@ -77,5 +77,5 @@ jobs:
             OPENCVE_VERSION=${{ needs.resolve.outputs.version }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}/opencve-airflow:${{ needs.resolve.outputs.version }}
-            ghcr.io/${{ github.repository }}/opencve-airflow:latest
+            ghcr.io/${{ github.repository | lower }}/opencve-airflow:${{ needs.resolve.outputs.version }}
+            ghcr.io/${{ github.repository | lower }}/opencve-airflow:latest
